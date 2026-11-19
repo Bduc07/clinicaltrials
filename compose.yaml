@@ -1,0 +1,5 @@
+services:
+  trials:
+    build: .
+    volumes:
+      - "${CLINICAL_TRIALS_HOST_DATA:-./data}:/app/data"
