@@ -1,5 +1,5 @@
 import json
-from datetime import date
+from datetime import date, datetime, timezone
 from io import BytesIO
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, urlsplit
 import duckdb
 import pytest
 
-from clinical_trials import api
+from clinical_trials import api, daily, watchdog
 from clinical_trials.pipeline import REPORTS, benchmark, cohort_dir, load_cached, report, sync
 
 CONDITION = "Type 1 Diabetes"
@@ -183,3 +183,51 @@ def test_client_honors_retry_after(monkeypatch):
     monkeypatch.setattr(api.time, "sleep", delays.append)
     assert api.Client().snapshot() == "2025-01-02T10:00:00"
     assert delays == [0, 7]
+
+
+def test_daily_failure_preserves_published_summary(tmp_path, monkeypatch):
+    import sqlite3
+    from contextlib import closing
+
+    record = study("NCT00000001", "RECRUITING", "2025-01-01")
+    fake_api(monkeypatch, "2025-01-02T10:00:00", [{"studies": [record]}])
+    client = api.Client(delay=0)
+    monkeypatch.setattr(client, "registry_count", lambda: 1)
+    sync(client, tmp_path, None)
+    monkeypatch.setattr(daily, "Client", lambda: client)
+    monkeypatch.setattr(daily, "now", lambda: datetime(2025, 1, 2, tzinfo=timezone.utc))
+    daily.refresh(tmp_path)
+    operations = cohort_dir(tmp_path, None) / "operations"
+    summary = operations / "latest.json"
+    published = summary.read_bytes()
+
+    def unavailable():
+        raise TimeoutError("registry unavailable")
+
+    monkeypatch.setattr(client, "snapshot", unavailable)
+    with pytest.raises(TimeoutError, match="registry unavailable"):
+        daily.refresh(tmp_path)
+    assert summary.read_bytes() == published
+    with closing(sqlite3.connect(operations / "runs.sqlite")) as log:
+        assert log.execute("SELECT status, rows_fetched, error FROM runs ORDER BY rowid").fetchall() == [
+            ("succeeded", 0, None),
+            ("failed", None, "registry unavailable"),
+        ]
+        next_check = datetime(2025, 1, 3, 3, tzinfo=timezone.utc)
+        watchdog.record_alerts(log, next_check)
+        watchdog.record_alerts(log, next_check)
+        assert log.execute("SELECT count(*) FROM alerts WHERE alert_key LIKE 'failure:%'").fetchone() == (1,)
+        assert log.execute("SELECT count(*) FROM alerts WHERE alert_key LIKE 'gap:%'").fetchone() == (1,)
+        delivered = []
+
+        def send(request, timeout):
+            delivered.append(json.loads(request.data)["content"])
+            response = BytesIO()
+            response.status = 204
+            return response
+
+        monkeypatch.setattr(watchdog, "urlopen", send)
+        webhook = "https://discord.com/api/webhooks/example/token"
+        watchdog.deliver_alerts(log, webhook)
+        watchdog.deliver_alerts(log, webhook)
+        assert len(delivered) == 2

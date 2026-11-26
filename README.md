@@ -65,6 +65,24 @@ Status history starts with the first successful observation. The latest-record e
 
 The offline suite uses synthetic study records to exercise pagination, caching, inclusive boundaries, empty batches, all reports, status changes, `Retry-After`, and rollback on duplicate IDs or invalid phases and statuses. Its Spark integration test checks exact silver parity and loads Spark Parquet into DuckDB gold. GitHub Actions installs Java 17 and PySpark and runs this suite on pushes and pull requests.
 
+## Operations
+
+The Windows deployment runs the full-registry incremental refresh via Task Scheduler at 7:35 p.m. Kathmandu time. It uses the existing local warehouse and DuckDB for daily silver batches. PySpark remains the full-registry CLI default. The task runs under the signed-in Windows account and can catch up after a missed start when the machine and session are available.
+
+Each run records its outcome, duration, source version, rows fetched, and status transitions in `data/registry/operations/runs.sqlite`. The job checks warehouse freshness and status history, runs all five SQL reports, and writes `latest.json` only after those checks and reports succeed. An unchanged source version is a successful run while the last loaded snapshot is fresh. The freshness check allows five calendar days for source publication gaps.
+
+`ClinicalTrialsWatchdog` runs hourly and at sign-in. It records failed runs and gaps of at least 26 hours between run starts in the `alerts` table in the same database. The refresh also checks for gaps before it records a new start, so a catch-up run preserves evidence of the gap. The laptop must be available for a local check to execute.
+
+For off-machine alerts, create a Discord webhook in the channel you want to use and save its URL as the sole line in `data/registry/operations/discord-webhook.txt`. This file is inside the ignored data directory. The watchdog sends queued alerts and records delivery after Discord accepts them. Before configuring the webhook, alerts remain in the local `alerts` table.
+
+To verify a run, check **Last Run Result** for `ClinicalTrialsDaily` in Task Scheduler and inspect `data/registry/operations/daily.log`. For a failure, check the source timestamp in the last successful `latest.json`, review the exception, then rerun the same task after resolving the cause. Verify the new run result, source timestamp, and report counts. Use the [incident log](INCIDENTS.md) to document live failures and recovery evidence.
+
+```powershell
+Get-ScheduledTaskInfo -TaskName ClinicalTrialsDaily
+Start-ScheduledTask -TaskName ClinicalTrialsDaily
+Start-ScheduledTask -TaskName ClinicalTrialsWatchdog
+```
+
 ## Source and terms
 
 Data are provided by ClinicalTrials.gov, a service of the U.S. National Library of Medicine. Review the official API documentation and terms before publishing derived data. The terms call for attribution, keeping distributed data current, displaying the source processing date, and describing modifications. These transformations select protocol metadata, flatten repeated fields, trim labels, deduplicate trial links, parse dates, and derive history and aggregates. Generated data stays local and is ignored by Git. [ClinicalTrials.gov API v2](https://clinicaltrials.gov/data-api/api) · [Study data fields](https://clinicaltrials.gov/data-api/about-api/study-data-structure) · [Terms and Conditions](https://clinicaltrials.gov/terms-conditions)
